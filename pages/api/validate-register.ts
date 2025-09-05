@@ -11,21 +11,17 @@ export default async function handler(req: any, res: any) {
   if (req.method !== 'POST') return res.status(405).end();
 
   const { email, firstName, lastName, siteId } = req.body || {};
-  if (!email || !siteId) {
-    return res.json({ ok: false, error: 'Missing email or siteId' });
-  }
+  if (!email || !siteId) return res.json({ ok: false, error: 'Missing email or siteId' });
 
   const idStr = String(siteId).trim();
-  if (!ID_SET.has(idStr)) {
-    return res.json({ ok: false, field: 'siteId', error: 'Invalid Site ID' });
-  }
+  if (!ID_SET.has(idStr)) return res.json({ ok: false, field: 'siteId', error: 'Invalid Site ID' });
 
   try {
-    let customerId = await findCustomerIdByEmail(email);
+    let customerId = await findCustomerIdByEmailExact(email);
     let action: 'created' | 'updated' | 'found' = 'found';
 
     if (!customerId) {
-      // Create
+      // CREATE — trust only the response ID; if absent, fail (do not search)
       const created = await adminREST(SHOP, ADMIN_TOKEN, `/customers.json`, {
         method: 'POST',
         body: {
@@ -39,35 +35,29 @@ export default async function handler(req: any, res: any) {
         }
       });
 
-      customerId = created?.customer?.id ?? created?.customers?.[0]?.id ?? null;
+      customerId = created?.customer?.id ?? null;
 
       if (!customerId) {
-        await sleep(350); // eventual consistency
-        customerId = await findCustomerIdByEmail(email);
-        if (!customerId) {
-          return res.json({
-            ok: false,
-            error: `Customer create returned no id. Response: ${JSON.stringify(created).slice(0, 300)}`
-          });
-        }
+        return res.json({
+          ok: false,
+          error: `Customer create returned no id`,
+          debug: {
+            shop: SHOP,
+            createRespSnippet: JSON.stringify(created).slice(0, 400)
+          }
+        });
       }
       action = 'created';
     } else {
-      // Update core fields
+      // UPDATE names (safe no-op if same)
       await adminREST(SHOP, ADMIN_TOKEN, `/customers/${customerId}.json`, {
         method: 'PUT',
-        body: {
-          customer: {
-            id: customerId,
-            first_name: firstName || '',
-            last_name: lastName || ''
-          }
-        }
+        body: { customer: { id: customerId, first_name: firstName || '', last_name: lastName || '' } }
       });
       action = 'updated';
     }
 
-    // --- HARD CONFIRM: read back by ID and assert email matches ---
+    // HARD CONFIRM — fetch by ID and assert email matches
     const confirm = await getCustomerById(customerId);
     if (!confirm) {
       return res.json({ ok: false, error: `Created/updated id ${customerId} not retrievable`, shop: SHOP });
@@ -81,51 +71,33 @@ export default async function handler(req: any, res: any) {
       });
     }
 
-    // Ensure tags: approved + debug tag
+    // TAGS — ensure approved + unique debug tag to find easily in Admin
     const debugTag = `debug-${Date.now()}`;
     await mergeTags(customerId, ['approved', debugTag]);
 
-    // Upsert metafields
-    await upsertMetafield(customerId, 'custom', 'custom_site_id', 'single_line_text_field', idStr); // ✅ correct key
+    // METAFIELDS — correct keys
+    await upsertMetafield(customerId, 'custom', 'custom_site_id', 'single_line_text_field', idStr);
     await upsertMetafield(customerId, 'custom', 'approved', 'boolean', 'true');
 
-    // Done
-    return res.json({
-      ok: true,
-      action,
-      customerId,
-      email,
-      siteId: idStr,
-      shop: SHOP
-    });
+    return res.json({ ok: true, action, customerId, email, siteId: idStr, shop: SHOP });
   } catch (e: any) {
-    console.error('validate-register error:', e?.message || e);
-    return res.json({ ok: false, error: e?.message || 'Server error', shop: SHOP });
+    return res.json({ ok: false, error: String(e?.message || e), shop: SHOP });
   }
 }
 
-/* ---------------- helpers ---------------- */
+/* ---------------- helpers (STRICT) ---------------- */
 
-async function findCustomerIdByEmail(email: string): Promise<number | null> {
+async function findCustomerIdByEmailExact(email: string): Promise<number | null> {
+  // Only exact, quoted search. Validate returned email matches exactly.
   try {
-    const quoted = await adminREST(SHOP, ADMIN_TOKEN, `/customers/search.json`, {
+    const resp = await adminREST(SHOP, ADMIN_TOKEN, `/customers/search.json`, {
       qs: { query: `email:"${email}"` }
     });
-    let id = quoted?.customers?.[0]?.id ?? null;
-    if (id) return id;
-
-    const unquoted = await adminREST(SHOP, ADMIN_TOKEN, `/customers/search.json`, {
-      qs: { query: `email:${email}` }
-    });
-    id = unquoted?.customers?.[0]?.id ?? null;
-    if (id) return id;
-  } catch {
-    // fall through
-  }
-
-  try {
-    const legacy = await adminREST(SHOP, ADMIN_TOKEN, `/customers.json`, { qs: { email } });
-    return legacy?.customers?.[0]?.id ?? null;
+    const c = resp?.customers?.[0];
+    if (c && (c.email || '').toLowerCase() === String(email).toLowerCase()) {
+      return c.id as number;
+    }
+    return null;
   } catch {
     return null;
   }
@@ -142,14 +114,11 @@ async function mergeTags(customerId: number, toAdd: string[]) {
     .split(',')
     .map((t: string) => t.trim())
     .filter(Boolean);
-
   const set = new Set(existingTags);
   for (const t of toAdd) set.add(t);
-
-  const newTags = Array.from(set).join(', ');
   await adminREST(SHOP, ADMIN_TOKEN, `/customers/${customerId}.json`, {
     method: 'PUT',
-    body: { customer: { id: customerId, tags: newTags } }
+    body: { customer: { id: customerId, tags: Array.from(set).join(', ') } }
   });
 }
 
@@ -157,7 +126,7 @@ async function upsertMetafield(
   customerId: number,
   namespace: string,
   key: string,
-  type: string, // 'single_line_text_field' | 'boolean' | etc
+  type: string,
   value: string
 ) {
   const list = await adminREST(SHOP, ADMIN_TOKEN, `/customers/${customerId}/metafields.json`);
@@ -174,8 +143,4 @@ async function upsertMetafield(
       body: { metafield: { id: existing.id, type, value } }
     });
   }
-}
-
-function sleep(ms: number) {
-  return new Promise((r) => setTimeout(r, ms));
 }
