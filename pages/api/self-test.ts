@@ -13,10 +13,6 @@ export default async function handler(_req: any, res: any) {
       shopFromToken: data?.shop?.myshopify_domain
     });
   } catch (e: any) {
-    res.json({
-      ok: false,
-      error: String(e?.message || e),
-      usingEnvShop: SHOP
-    });
+    res.json({ ok: false, error: String(e?.message || e), usingEnvShop: SHOP });
   }
 }
