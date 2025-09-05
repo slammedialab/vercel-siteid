@@ -6,14 +6,19 @@ import { withCORS } from '../../lib/cors';
 const SHOP = process.env.SHOP as string;            // e.g. centeringhealthcare.myshopify.com
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN as string;
 
-// Toggle if you want to use GraphQL paths instead of REST for create/update/metafields
+// If you want to retry GraphQL later, set this true and set GRAPHQL_API_VERSION below.
 const USE_GRAPHQL = false;
-const GRAPHQL_API_VERSION = process.env.SHOPIFY_API_VERSION || '2025-04';
+const GRAPHQL_API_VERSION = process.env.SHOPIFY_API_VERSION || '2025-04'; // safer fallback
 
-const ID_SET = new Set<string>(ids as string[]);
+// Normalize ALL ids to strings
+const ID_SET = new Set(
+  (ids as Array<string | number>)
+    .filter(Boolean)
+    .map(v => String(v).trim())
+);
 
 /* ---------------- GraphQL helper (disabled by default) ---------------- */
-async function adminGraphQL<T = any>(query: string, variables?: Record<string, any>): Promise<T> {
+async function adminGraphQL<T=any>(query: string, variables?: Record<string, any>): Promise<T> {
   const url = `https://${SHOP}/admin/api/${GRAPHQL_API_VERSION}/graphql.json`;
   const r = await fetch(url, {
     method: 'POST',
@@ -21,10 +26,10 @@ async function adminGraphQL<T = any>(query: string, variables?: Record<string, a
     body: JSON.stringify({ query, variables })
   });
   const json = await r.json();
-  if (!r.ok || (json as any)?.errors) {
-    throw new Error(`GraphQL ${r.status}: ${JSON.stringify(json).slice(0, 400)}`);
+  if (!r.ok || json.errors) {
+    throw new Error(`GraphQL ${r.status}: ${JSON.stringify(json).slice(0,400)}`);
   }
-  return (json as any).data;
+  return json.data;
 }
 
 const GQL_CREATE = `
@@ -45,28 +50,16 @@ const GQL_META_SET = `
 
 /* ---------------- Route ---------------- */
 export default async function handler(req: any, res: any) {
-  // CORS + preflight
   withCORS(res);
+  res.setHeader('Cache-Control', 'no-store');
   if (req.method === 'OPTIONS') return res.status(204).end();
+  if (req.method !== 'POST')    return res.status(405).end();
 
-  // Method guard
-  if (req.method !== 'POST') return res.status(405).end();
-
-  // Env guard (helps diagnose config issues fast)
-  if (!SHOP || !ADMIN_TOKEN) {
-    return res.status(500).json({ ok: false, error: 'Server not configured: missing SHOP or ADMIN_TOKEN env', shop: SHOP || null });
-  }
-
-  // Expect JSON body with at least email + siteId
   const { email, firstName, lastName, siteId } = req.body || {};
-  if (!email || !siteId) {
-    return res.json({ ok: false, error: 'Missing email or siteId', field: !email ? 'email' : 'siteId', shop: SHOP });
-  }
+  if (!email || !siteId) return res.json({ ok:false, error:'Missing email or siteId', shop: SHOP });
 
   const siteIdStr = String(siteId).trim();
-  if (!ID_SET.has(siteIdStr)) {
-    return res.json({ ok: false, field: 'siteId', error: 'Invalid Site ID', shop: SHOP });
-  }
+  if (!ID_SET.has(siteIdStr)) return res.json({ ok:false, field:'siteId', error:'Invalid Site ID', shop: SHOP });
 
   try {
     const emailLower = String(email).toLowerCase();
@@ -75,21 +68,21 @@ export default async function handler(req: any, res: any) {
     const existingId = await findCustomerIdByEmailExact(emailLower);
 
     let customerId: number;
-    let action: 'created' | 'updated';
+    let action: 'created'|'updated';
 
     if (!existingId) {
       // ---------- CREATE ----------
       if (USE_GRAPHQL) {
         const created = await adminGraphQL(GQL_CREATE, {
-          input: { email: emailLower, firstName: firstName || null, lastName: lastName || null, tags: ['approved'] }
+          input: { email: emailLower, firstName: firstName||null, lastName: lastName||null, tags: ['approved'] }
         });
-        const errs = (created as any)?.customerCreate?.userErrors;
-        if (errs?.length) return res.json({ ok: false, error: 'customerCreate userErrors', details: errs, shop: SHOP });
-        const gid = (created as any)?.customerCreate?.customer?.id as string | undefined;
-        if (!gid) return res.json({ ok: false, error: 'customerCreate returned no id', shop: SHOP });
+        const errs = created?.customerCreate?.userErrors;
+        if (errs?.length) return res.json({ ok:false, error:'customerCreate userErrors', details:errs, shop: SHOP });
+        const gid = created?.customerCreate?.customer?.id;
+        if (!gid) return res.json({ ok:false, error:'customerCreate returned no id', shop: SHOP });
         customerId = Number(gid.split('/').pop());
       } else {
-        const createResp = await adminREST(SHOP, ADMIN_TOKEN, '/customers.json', {
+        const createResp = await adminREST(SHOP, ADMIN_TOKEN, `/customers.json`, {
           method: 'POST',
           body: {
             customer: {
@@ -102,16 +95,14 @@ export default async function handler(req: any, res: any) {
           }
         });
 
-        // REST create should return { customer: { id, ... } }
         const createdId = createResp?.customer?.id ?? null;
         if (!createdId) {
-          // attempt a STRICT re-check by exact email
           const recheck = await findCustomerIdByEmailExact(emailLower);
           if (!recheck) {
             return res.json({
-              ok: false,
-              error: 'Customer create returned no id',
-              debug: { shop: SHOP, createRespSnippet: JSON.stringify(createResp).slice(0, 400) }
+              ok:false,
+              error:'Customer create returned no id',
+              debug:{ shop: SHOP, createRespSnippet: JSON.stringify(createResp).slice(0,400) }
             });
           }
           customerId = recheck;
@@ -126,14 +117,14 @@ export default async function handler(req: any, res: any) {
         const gid = `gid://shopify/Customer/${existingId}`;
         const updated = await adminGraphQL(GQL_UPDATE, {
           id: gid,
-          input: { firstName: firstName || null, lastName: lastName || null }
+          input: { firstName: firstName||null, lastName: lastName||null }
         });
-        const errs = (updated as any)?.customerUpdate?.userErrors;
-        if (errs?.length) return res.json({ ok: false, error: 'customerUpdate userErrors', details: errs, shop: SHOP });
+        const errs = updated?.customerUpdate?.userErrors;
+        if (errs?.length) return res.json({ ok:false, error:'customerUpdate userErrors', details:errs, shop: SHOP });
       } else {
         await adminREST(SHOP, ADMIN_TOKEN, `/customers/${existingId}.json`, {
           method: 'PUT',
-          body: { customer: { id: existingId, first_name: firstName || '', last_name: lastName || '' } }
+          body: { customer: { id: existingId, first_name: firstName||'', last_name: lastName||'' } }
         });
       }
       customerId = existingId;
@@ -145,61 +136,54 @@ export default async function handler(req: any, res: any) {
     const foundEmail = (confirm?.customer?.email || '').toLowerCase();
     if (foundEmail !== emailLower) {
       return res.json({
-        ok: false,
-        error: `ID/email mismatch. ID ${customerId} belongs to ${confirm?.customer?.email || '(no email)'}`,
-        debug: { expectedEmail: emailLower, foundEmail, shop: SHOP }
+        ok:false,
+        error:`ID/email mismatch. ID ${customerId} belongs to ${confirm?.customer?.email || '(no email)'}`,
+        debug:{ expectedEmail: emailLower, foundEmail, shop: SHOP }
       });
     }
 
     // ---------- ENSURE TAGS (approved + debug) ----------
     const existingTags = (confirm?.customer?.tags || '')
-      .split(',')
-      .map((t: string) => t.trim())
-      .filter(Boolean);
+      .split(',').map((t: string)=>t.trim()).filter(Boolean);
     const tagSet = new Set(existingTags);
     tagSet.add('approved');
     const debugTag = `debug-${Date.now()}`;
     tagSet.add(debugTag);
-
     await adminREST(SHOP, ADMIN_TOKEN, `/customers/${customerId}.json`, {
       method: 'PUT',
       body: { customer: { id: customerId, tags: Array.from(tagSet).join(', ') } }
     });
 
-    // ---------- METAFIELDS: custom.custom_site_id + custom.approved ----------
+    // ---------- METAFIELDS ----------
     if (USE_GRAPHQL) {
       const gid = `gid://shopify/Customer/${customerId}`;
       const metaWrite = await adminGraphQL(GQL_META_SET, {
         metafields: [
-          { ownerId: gid, namespace: 'custom', key: 'custom_site_id', type: 'single_line_text_field', value: siteIdStr },
-          { ownerId: gid, namespace: 'custom', key: 'approved', type: 'boolean', value: 'true' }
+          { ownerId: gid, namespace:'custom', key:'custom_site_id', type:'single_line_text_field', value: siteIdStr },
+          { ownerId: gid, namespace:'custom', key:'approved',       type:'boolean',               value:'true' }
         ]
       });
-      const metaErrs = (metaWrite as any)?.metafieldsSet?.userErrors;
-      if (metaErrs?.length) return res.json({ ok: false, error: 'metafieldsSet userErrors', details: metaErrs, shop: SHOP });
+      const metaErrs = metaWrite?.metafieldsSet?.userErrors;
+      if (metaErrs?.length) return res.json({ ok:false, error:'metafieldsSet userErrors', details: metaErrs, shop: SHOP });
     } else {
       await upsertMetafieldREST(customerId, 'custom', 'custom_site_id', 'single_line_text_field', siteIdStr);
-      await upsertMetafieldREST(customerId, 'custom', 'approved', 'boolean', 'true');
+      await upsertMetafieldREST(customerId, 'custom', 'approved',       'boolean',                'true');
     }
 
-    // ---------- DONE ----------
-    return res.json({ ok: true, action, customerId, email: emailLower, siteId: siteIdStr, shop: SHOP, debugTag });
-  } catch (e: any) {
-    return res.json({ ok: false, error: String(e?.message || e), shop: SHOP });
+    return res.json({ ok:true, action, customerId, email: emailLower, siteId: siteIdStr, shop: SHOP, debugTag });
+  } catch (e:any) {
+    return res.json({ ok:false, error: String(e?.message || e), shop: SHOP });
   }
 }
 
 /* ---------------- STRICT helpers (REST) ---------------- */
-async function findCustomerIdByEmailExact(emailLower: string): Promise<number | null> {
-  // Exact, quoted search only; accept only if returned email exactly matches.
+async function findCustomerIdByEmailExact(emailLower: string): Promise<number|null> {
   try {
-    const resp = await adminREST(SHOP, ADMIN_TOKEN, '/customers/search.json', { qs: { query: `email:"${emailLower}"` } });
+    const resp = await adminREST(SHOP, ADMIN_TOKEN, `/customers/search.json`, { qs: { query: `email:"${emailLower}"` } });
     const c = resp?.customers?.[0];
     if (c && (c.email || '').toLowerCase() === emailLower) return c.id as number;
     return null;
-  } catch {
-    return null;
-  }
+  } catch { return null; }
 }
 
 async function upsertMetafieldREST(
@@ -210,7 +194,7 @@ async function upsertMetafieldREST(
   value: string
 ) {
   const list = await adminREST(SHOP, ADMIN_TOKEN, `/customers/${customerId}/metafields.json`);
-  const existing = (list?.metafields || []).find((m: any) => m.namespace === namespace && m.key === key);
+  const existing = (list?.metafields || []).find((m:any) => m.namespace === namespace && m.key === key);
 
   if (!existing) {
     await adminREST(SHOP, ADMIN_TOKEN, `/customers/${customerId}/metafields.json`, {
