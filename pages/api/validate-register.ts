@@ -16,11 +16,10 @@ export default async function handler(req: any, res: any) {
   if (!ID_SET.has(id)) return res.json({ ok: false, field: 'siteId', error: 'Invalid Site ID' });
 
   try {
-    let customerId: number | null = null;
+    // 1) Find existing
+    let customerId = await findCustomerIdByEmail(email);
 
-    // 1) Robust find-by-email
-    customerId = await findCustomerIdByEmail(email);
-    // 2) Create if not found, with duplicate + post-create lookup fallback
+    // 2) Create if not found
     if (!customerId) {
       try {
         const created = await adminREST(SHOP, ADMIN_TOKEN, `/customers.json`, {
@@ -36,11 +35,14 @@ export default async function handler(req: any, res: any) {
           }
         });
 
-        customerId = created?.customer?.id ?? null;
+        // Accept either shape: {customer:{...}} OR {customers:[{...}]}
+        customerId =
+          created?.customer?.id ??
+          created?.customers?.[0]?.id ??
+          null;
 
-        // Immediately re-search if create returned no id (eventual consistency)
+        // Fallback: tiny delay then re-search (eventual consistency)
         if (!customerId) {
-          // slight delay to allow indexing
           await sleep(350);
           customerId = await findCustomerIdByEmail(email);
 
@@ -54,7 +56,7 @@ export default async function handler(req: any, res: any) {
       } catch (e: any) {
         const msg = String(e?.message || '');
 
-        // Duplicate/validation path: re-search by email and continue
+        // Duplicate or validation errors: search and continue
         if (/already.*(taken|exists)/i.test(msg) || /email/i.test(msg)) {
           await sleep(200);
           customerId = await findCustomerIdByEmail(email);
@@ -86,24 +88,37 @@ export default async function handler(req: any, res: any) {
 }
 
 async function findCustomerIdByEmail(email: string): Promise<number | null> {
-  // Try quoted email first (more precise), then unquoted as a fallback.
-  const quoted = await adminREST(SHOP, ADMIN_TOKEN, `/customers/search.json`, {
-    qs: { query: `email:"${email}"` }
-  });
-  let id: number | null = quoted?.customers?.[0]?.id ?? null;
+  // Preferred: search endpoint with quoted email
+  try {
+    const quoted = await adminREST(SHOP, ADMIN_TOKEN, `/customers/search.json`, {
+      qs: { query: `email:"${email}"` }
+    });
+    let id: number | null = quoted?.customers?.[0]?.id ?? null;
+    if (id) return id;
 
-  if (!id) {
     const unquoted = await adminREST(SHOP, ADMIN_TOKEN, `/customers/search.json`, {
       qs: { query: `email:${email}` }
     });
     id = unquoted?.customers?.[0]?.id ?? null;
+    if (id) return id;
+  } catch {
+    // ignore and try the legacy route below
   }
 
-  return id;
+  // Legacy fallback: /customers.json?email=...
+  try {
+    const legacy = await adminREST(SHOP, ADMIN_TOKEN, `/customers.json`, {
+      qs: { email }
+    });
+    const id = legacy?.customers?.[0]?.id ?? null;
+    return id ?? null;
+  } catch {
+    return null;
+  }
 }
 
 async function ensureApprovedTag(customerId: number) {
-  // Fetch the single customer to read current tags
+  // Fetch single customer (ensures we have the current tags)
   const customerResp = await adminREST(SHOP, ADMIN_TOKEN, `/customers/${customerId}.json`);
   const existingTags = customerResp?.customer?.tags || '';
   const tags = new Set(existingTags.split(',').map((t: string) => t.trim()).filter(Boolean));
