@@ -1,6 +1,7 @@
 // pages/api/validate-register.ts
-import ids from '../../data/site-ids.json' assert { type: 'json' };
-import { adminGraphQL } from '../../lib/shopify.js';
+import ids from '../../data/site-ids.json';
+import { adminGraphQL } from '../../lib/shopify';
+
 
 const ID_SET = new Set<string>(ids as string[]);
 const SHOP = process.env.SHOP as string;               // yourshop.myshopify.com

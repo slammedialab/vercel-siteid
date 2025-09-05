@@ -1,5 +1,5 @@
 // pages/api/validate-siteid.ts
-import ids from '../../data/site-ids.json' assert { type: 'json' };
+import ids from '../../data/site-ids.json';
 
 const ID_SET = new Set<string>(ids as string[]);
 
