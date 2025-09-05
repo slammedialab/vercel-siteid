@@ -1,11 +1,10 @@
 // pages/api/validate-register.ts
 import ids from '../../data/site-ids.json';
-import { adminGraphQL } from '../../lib/shopify';
-
+import { adminREST } from '../../lib/shopify';
 
 const ID_SET = new Set<string>(ids as string[]);
-const SHOP = process.env.SHOP as string;               // yourshop.myshopify.com
-const ADMIN_TOKEN = process.env.ADMIN_TOKEN as string; // Admin API token
+const SHOP = process.env.SHOP as string;
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN as string;
 
 export default async function handler(req: any, res: any) {
   if (req.method !== 'POST') return res.status(405).end();
@@ -17,53 +16,63 @@ export default async function handler(req: any, res: any) {
   if (!ID_SET.has(id)) return res.json({ ok:false, field:'siteId', error:'Invalid Site ID' });
 
   try {
-    // 1) Create (or detect existing) customer
-    const createQ = `mutation customerCreate($input: CustomerInput!) {
-      customerCreate(input: $input) {
-        customer { id email }
-        userErrors { field message }
+    // find existing
+    const search = await adminREST(SHOP, ADMIN_TOKEN, `/customers/search.json`, {
+      qs: { query: `email:${email}` }
+    });
+    let customerId: number | null = search?.customers?.[0]?.id ?? null;
+
+    // create if missing
+    if (!customerId) {
+      const created = await adminREST(SHOP, ADMIN_TOKEN, `/customers.json`, {
+        method: 'POST',
+        body: { customer: { email, first_name: firstName || '', last_name: lastName || '', tags: 'approved' } }
+      });
+      customerId = created?.customer?.id ?? null;
+      if (!customerId) throw new Error('Customer create failed');
+    } else {
+      // ensure tag
+      const existing = search.customers[0];
+      const tags = new Set((existing.tags || '').split(',').map((t: string) => t.trim()).filter(Boolean));
+      if (!tags.has('approved')) {
+        tags.add('approved');
+        await adminREST(SHOP, ADMIN_TOKEN, `/customers/${customerId}.json`, {
+          method: 'PUT',
+          body: { customer: { id: customerId, tags: Array.from(tags).join(', ') } }
+        });
       }
-    }`;
-    const input = { email, firstName, lastName, tags: ['approved'] };
-    const createResp: any = await adminGraphQL(SHOP, ADMIN_TOKEN, createQ, { input });
-
-    let customerId = createResp?.data?.customerCreate?.customer?.id;
-    const err = createResp?.data?.customerCreate?.userErrors?.[0];
-
-    if (err && /already.*(taken|exists)/i.test(err.message)) {
-      // find existing by email
-      const findQ = `query ($query:String!) {
-        customers(first:1, query:$query) { edges { node { id email } } }
-      }`;
-      const found: any = await adminGraphQL(SHOP, ADMIN_TOKEN, findQ, { query: `email:${email}` });
-      customerId = found?.data?.customers?.edges?.[0]?.node?.id;
-      if (!customerId) return res.json({ ok:false, error:'Customer lookup failed' });
-
-      // ensure approved tag
-      const tagsM = `mutation tagsAdd($id:ID!, $tags:[String!]!) {
-        tagsAdd(id:$id, tags:$tags) { node { id } userErrors { field message } }
-      }`;
-      await adminGraphQL(SHOP, ADMIN_TOKEN, tagsM, { id: customerId, tags: ['approved'] });
-    } else if (err) {
-      return res.json({ ok:false, error: err.message });
     }
 
-    if (!customerId) customerId = createResp.data.customerCreate.customer.id;
+    // upsert metafields
+    await upsertMetafield(customerId!, 'custom', 'site_id', 'single_line_text_field', id);
+    await upsertMetafield(customerId!, 'custom', 'approved', 'boolean', 'true');
 
-    // 2) Set metafields: custom.site_id + custom.approved
-    const mfM = `mutation mf($metafields:[MetafieldsSetInput!]!) {
-      metafieldsSet(metafields:$metafields) { userErrors { field message } }
-    }`;
-    const metafields = [
-      { ownerId: customerId, namespace:'custom', key:'site_id', type:'single_line_text_field', value: id },
-      { ownerId: customerId, namespace:'custom', key:'approved', type:'boolean', value: 'true' }
-    ];
-    const mfResp: any = await adminGraphQL(SHOP, ADMIN_TOKEN, mfM, { metafields });
-    const mfErr = mfResp?.data?.metafieldsSet?.userErrors?.[0];
-    if (mfErr) return res.json({ ok:false, error: mfErr.message });
-
-    res.json({ ok:true });
+    return res.json({ ok: true });
   } catch (e: any) {
-    res.json({ ok:false, error: e.message || 'Server error' });
+    console.error('register error:', e?.message);
+    return res.json({ ok:false, error: e?.message || 'Server error' });
+  }
+}
+
+async function upsertMetafield(
+  customerId: number,
+  namespace: string,
+  key: string,
+  type: string,
+  value: string
+) {
+  const list = await adminREST(SHOP, ADMIN_TOKEN, `/customers/${customerId}/metafields.json`);
+  const existing = (list?.metafields || []).find((m: any) => m.namespace === namespace && m.key === key);
+
+  if (!existing) {
+    await adminREST(SHOP, ADMIN_TOKEN, `/customers/${customerId}/metafields.json`, {
+      method: 'POST',
+      body: { metafield: { namespace, key, type, value } }
+    });
+  } else {
+    await adminREST(SHOP, ADMIN_TOKEN, `/metafields/${existing.id}.json`, {
+      method: 'PUT',
+      body: { metafield: { id: existing.id, value, type } }
+    });
   }
 }
