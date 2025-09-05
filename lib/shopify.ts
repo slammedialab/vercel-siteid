@@ -1,19 +1,21 @@
 // lib/shopify.ts
 
+/** Returns the Admin API version to use, defaulting to a current, supported one. */
 export function apiVersion() {
     return process.env.SHOPIFY_API_VERSION || '2025-07';
   }
   
-  // Allow JSON objects for body
+  /** Allow JSON bodies and query params while keeping the Fetch API shape. */
   type RESTInit = Omit<RequestInit, 'body'> & {
     qs?: Record<string, string>;
-    body?: any; // we'll JSON.stringify if it's not a string
+    body?: any; // Will JSON.stringify if not a string
   };
   
+  /** Minimal Admin REST helper. Throws with a readable snippet on non-2xx. */
   export async function adminREST(
     shop: string,
     adminToken: string,
-    path: string,            // e.g. `/customers.json`
+    path: string,     // e.g. '/customers.json'
     init?: RESTInit
   ) {
     const version = apiVersion();
