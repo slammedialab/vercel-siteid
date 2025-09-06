@@ -3,13 +3,10 @@ import ids from '../../data/site-ids.json';
 import { adminREST } from '../../lib/shopify';
 import { withCORS } from '../../lib/cors';
 
-const SHOP = process.env.SHOP as string;                 // e.g. myshop.myshopify.com
+const SHOP = process.env.SHOP as string;                 // e.g. your-shop.myshopify.com
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN as string;
 
-// Admin API version (for your adminREST helper & optional adminGraphQL)
-const GRAPHQL_API_VERSION = process.env.SHOPIFY_API_VERSION || '2025-07';
-
-// Storefront API (used to create customer WITH PASSWORD for Classic auto-login)
+// Storefront (for creating with password)
 const SF_API_VERSION   = process.env.STOREFRONT_API_VERSION || '2025-07';
 const STOREFRONT_TOKEN = process.env.STOREFRONT_TOKEN as string;
 const SF_URL           = `https://${SHOP}/api/${SF_API_VERSION}/graphql.json`;
@@ -17,7 +14,7 @@ const SF_URL           = `https://${SHOP}/api/${SF_API_VERSION}/graphql.json`;
 // Accept both ["910001"] and [910001]
 const ID_SET = new Set<string>((ids as any[]).map(v => String(v).trim()));
 
-/* --------------------------------- Storefront --------------------------------- */
+/* ---------------- Storefront helpers ---------------- */
 function genTempPassword(): string {
   const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*()_+-=';
   return Array.from({ length: 18 }, () => chars[Math.floor(Math.random() * chars.length)]).join('');
@@ -46,55 +43,38 @@ const SF_CUSTOMER_CREATE = `
   }
 `;
 
-/* --------------------------------- Admin GQL (optional, not used for create) --------------------------------- */
-async function adminGraphQL<T = any>(query: string, variables?: Record<string, any>): Promise<T> {
-  const url = `https://${SHOP}/admin/api/${GRAPHQL_API_VERSION}/graphql.json`;
-  const r = await fetch(url, {
-    method: 'POST',
-    headers: { 'X-Shopify-Access-Token': ADMIN_TOKEN, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ query, variables }),
-  });
-  const json = await r.json();
-  if (!r.ok || json.errors) throw new Error(`GraphQL ${r.status}: ${JSON.stringify(json).slice(0, 400)}`);
-  return json.data;
-}
-
-const GQL_META_SET = `
-  mutation metafieldsSet($metafields:[MetafieldsSetInput!]!){
-    metafieldsSet(metafields:$metafields){ metafields{ownerId key namespace} userErrors{field message} }
-  }
-`;
-
-/* --------------------------------- Route --------------------------------- */
+/* ---------------- Route ---------------- */
 export default async function handler(req: any, res: any) {
   withCORS(res);
   if (req.method === 'OPTIONS') return res.status(204).end();
   if (req.method !== 'POST')    return res.status(405).end();
 
-  const { email, firstName, lastName, siteId, phone, titleRole } = req.body || {};
-  if (!email || !siteId) return res.json({ ok: false, error: 'Missing email or siteId', shop: SHOP });
+  const { email, firstName, lastName, phone, siteId, titleRole, password } = req.body || {};
+  if (!email || !siteId) return res.json({ ok:false, error:'Missing email or siteId', shop: SHOP });
 
   const siteIdStr = String(siteId).trim();
-  if (!ID_SET.has(siteIdStr)) return res.json({ ok: false, field: 'siteId', error: 'Invalid Site ID', shop: SHOP });
+  if (!ID_SET.has(siteIdStr)) return res.json({ ok:false, field:'siteId', error:'Invalid Site ID', shop: SHOP });
 
   try {
     const emailLower = String(email).toLowerCase();
 
-    // STRICT FIND by exact email
+    // Strict exact email lookup
     const existingId = await findCustomerIdByEmailExact(emailLower);
 
     let customerId: number;
     let action: 'created' | 'updated';
-    let tempPassword: string | undefined;
+    let finalPassword: string | undefined;
 
     if (!existingId) {
-      // CREATE WITH PASSWORD via Storefront API (Classic accounts need this for auto-login)
-      tempPassword = genTempPassword();
+      // Create WITH the provided password (or generate fallback)
+      const chosenPassword =
+        (typeof password === 'string' && password.length >= 8) ? password : genTempPassword();
+      finalPassword = chosenPassword;
 
       const sf = await storefrontGraphQL(SF_CUSTOMER_CREATE, {
         input: {
           email: emailLower,
-          password: tempPassword,
+          password: chosenPassword,
           firstName: firstName || null,
           lastName:  lastName  || null,
           phone:     phone     || null,
@@ -112,13 +92,13 @@ export default async function handler(req: any, res: any) {
         });
       }
 
-      const gid = (sf as any)?.customerCreate?.customer?.id;
-      if (!gid) return res.json({ ok: false, error: 'customerCreate returned no id', shop: SHOP });
+      const gid = (sf as any)?.customerCreate?.customer?.id; // gid://shopify/Customer/<id>
+      if (!gid) return res.json({ ok:false, error:'customerCreate returned no id', shop: SHOP });
 
       customerId = Number(String(gid).split('/').pop());
       action = 'created';
     } else {
-      // UPDATE (cannot set password for an existing customer here)
+      // Update names (cannot set password here)
       await adminREST(SHOP, ADMIN_TOKEN, `/customers/${existingId}.json`, {
         method: 'PUT',
         body: { customer: { id: existingId, first_name: firstName || '', last_name: lastName || '' } },
@@ -127,52 +107,49 @@ export default async function handler(req: any, res: any) {
       action = 'updated';
     }
 
-    // HARD CONFIRM BY ID
+    // Confirm the email for this ID (defensive)
     const confirm = await adminREST(SHOP, ADMIN_TOKEN, `/customers/${customerId}.json`);
     const foundEmail = (confirm?.customer?.email || '').toLowerCase();
     if (foundEmail !== emailLower) {
       return res.json({
-        ok: false,
-        error: `ID/email mismatch. ID ${customerId} belongs to ${confirm?.customer?.email || '(no email)'}`,
-        debug: { expectedEmail: emailLower, foundEmail, shop: SHOP },
+        ok:false,
+        error:`ID/email mismatch. ID ${customerId} belongs to ${confirm?.customer?.email || '(no email)'}`,
+        debug:{ expectedEmail: emailLower, foundEmail, shop: SHOP }
       });
     }
 
-    // ENSURE TAG: approved
+    // Ensure tag 'approved'
     const existingTags = (confirm?.customer?.tags || '')
-      .split(',')
-      .map((t: string) => t.trim())
-      .filter(Boolean);
+      .split(',').map((t:string)=>t.trim()).filter(Boolean);
     const tagSet = new Set(existingTags);
     tagSet.add('approved');
     await adminREST(SHOP, ADMIN_TOKEN, `/customers/${customerId}.json`, {
-      method: 'PUT',
-      body: { customer: { id: customerId, tags: Array.from(tagSet).join(', ') } },
+      method:'PUT',
+      body:{ customer: { id: customerId, tags: Array.from(tagSet).join(', ') } }
     });
 
-    // METAFIELDS (REST upsert) — custom.custom_site_id, custom.approved, custom.titlerole
+    // === WRITE METAFIELDS BEFORE RESPONDING ===
     await upsertMetafieldREST(customerId, 'custom', 'custom_site_id', 'single_line_text_field', siteIdStr);
-    await upsertMetafieldREST(customerId, 'custom', 'approved', 'boolean', 'true');
+    await upsertMetafieldREST(customerId, 'custom', 'approved',       'boolean',               'true');
     if (typeof titleRole === 'string' && titleRole.trim()) {
-      await upsertMetafieldREST(customerId, 'custom', 'titlerole', 'single_line_text_field', String(titleRole).trim());
+      await upsertMetafieldREST(customerId, 'custom', 'titlerole',    'single_line_text_field', String(titleRole).trim());
     }
 
-    // DONE — return payload front-end already understands
-    if (action === 'created' && tempPassword) {
-      // Your FE will auto-submit to /account/login with these
+    // Respond:
+    if (action === 'created' && finalPassword) {
+      // No redirect so client posts to /account/login using this password
       return res.json({
         ok: true,
         action,
         customerId,
         email: emailLower,
         siteId: siteIdStr,
-        password: tempPassword,
-        redirect: '/account',
-        shop: SHOP,
+        password: finalPassword,
+        shop: SHOP
       });
     }
 
-    // Existing customer path — can’t set password here; send them to login (prefilled)
+    // Existing account (can’t set password) – send to login page (prefilled)
     return res.json({
       ok: true,
       action,
@@ -180,14 +157,15 @@ export default async function handler(req: any, res: any) {
       email: emailLower,
       siteId: siteIdStr,
       redirect: `/account/login?email=${encodeURIComponent(emailLower)}`,
-      shop: SHOP,
+      shop: SHOP
     });
-  } catch (e: any) {
-    return res.json({ ok: false, error: String(e?.message || e), shop: SHOP });
+
+  } catch (e:any) {
+    return res.json({ ok:false, error: String(e?.message || e), shop: SHOP });
   }
 }
 
-/* ---------------- STRICT helpers (Admin REST) ---------------- */
+/* ---------------- Helpers ---------------- */
 async function findCustomerIdByEmailExact(emailLower: string): Promise<number | null> {
   try {
     const resp = await adminREST(SHOP, ADMIN_TOKEN, `/customers/search.json`, { qs: { query: `email:"${emailLower}"` } });
@@ -212,12 +190,12 @@ async function upsertMetafieldREST(
   if (!existing) {
     await adminREST(SHOP, ADMIN_TOKEN, `/customers/${customerId}/metafields.json`, {
       method: 'POST',
-      body: { metafield: { namespace, key, type, value } },
+      body: { metafield: { namespace, key, type, value } }
     });
   } else {
     await adminREST(SHOP, ADMIN_TOKEN, `/metafields/${existing.id}.json`, {
       method: 'PUT',
-      body: { metafield: { id: existing.id, type, value } },
+      body: { metafield: { id: existing.id, type, value } }
     });
   }
 }
