@@ -14,7 +14,6 @@ const SF_URL           = `https://${SHOP}/api/${SF_API_VERSION}/graphql.json`;
 // Accept both ["910001"] and [910001]
 const ID_SET = new Set<string>((ids as any[]).map(v => String(v).trim()));
 
-/* ---------------- Storefront helpers ---------------- */
 function genTempPassword(): string {
   const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*()_+-=';
   return Array.from({ length: 18 }, () => chars[Math.floor(Math.random() * chars.length)]).join('');
@@ -43,7 +42,6 @@ const SF_CUSTOMER_CREATE = `
   }
 `;
 
-/* ---------------- Route ---------------- */
 export default async function handler(req: any, res: any) {
   withCORS(res);
   if (req.method === 'OPTIONS') return res.status(204).end();
@@ -66,7 +64,7 @@ export default async function handler(req: any, res: any) {
     let finalPassword: string | undefined;
 
     if (!existingId) {
-      // Create WITH the provided password (or generate fallback)
+      // Create WITH provided password (or generate fallback)
       const chosenPassword =
         (typeof password === 'string' && password.length >= 8) ? password : genTempPassword();
       finalPassword = chosenPassword;
