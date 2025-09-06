@@ -2,10 +2,7 @@
 import ids from '../../data/site-ids.json';
 import { withCORS } from '../../lib/cors';
 
-// Normalize ALL ids to strings once
-// robust: accept ["910001"] OR [910001]
 const ID_SET = new Set<string>((ids as any[]).map(v => String(v).trim()));
-
 
 export default async function handler(req: any, res: any) {
   withCORS(res);
