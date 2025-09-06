@@ -1,165 +1,142 @@
 // pages/api/validate-register.ts
+
 import ids from '../../data/site-ids.json';
 import { adminREST } from '../../lib/shopify';
 import { withCORS } from '../../lib/cors';
 
-const SHOP = process.env.SHOP as string;                 // e.g. your-shop.myshopify.com
+const SHOP = process.env.SHOP as string;            // e.g. yourshop.myshopify.com
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN as string;
 
-// Storefront (for creating with password)
-const SF_API_VERSION   = process.env.STOREFRONT_API_VERSION || '2025-07';
-const STOREFRONT_TOKEN = process.env.STOREFRONT_TOKEN as string;
-const SF_URL           = `https://${SHOP}/api/${SF_API_VERSION}/graphql.json`;
-
-// Accept both ["910001"] and [910001]
+// We are NOT using Storefront or GraphQL here to avoid 401s.
 const ID_SET = new Set<string>((ids as any[]).map(v => String(v).trim()));
-
-function genTempPassword(): string {
-  const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*()_+-=';
-  return Array.from({ length: 18 }, () => chars[Math.floor(Math.random() * chars.length)]).join('');
-}
-
-async function storefrontGraphQL<T = any>(query: string, variables?: Record<string, any>): Promise<T> {
-  const r = await fetch(SF_URL, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'X-Shopify-Storefront-Access-Token': STOREFRONT_TOKEN,
-    },
-    body: JSON.stringify({ query, variables }),
-  });
-  const json = await r.json();
-  if (!r.ok || json.errors) throw new Error(`Storefront ${r.status}: ${JSON.stringify(json).slice(0, 400)}`);
-  return json.data as T;
-}
-
-const SF_CUSTOMER_CREATE = `
-  mutation customerCreate($input: CustomerCreateInput!) {
-    customerCreate(input: $input) {
-      customer { id email }
-      userErrors { field message code }
-    }
-  }
-`;
 
 export default async function handler(req: any, res: any) {
   withCORS(res);
   if (req.method === 'OPTIONS') return res.status(204).end();
   if (req.method !== 'POST')    return res.status(405).end();
 
-  const { email, firstName, lastName, phone, siteId, titleRole, password } = req.body || {};
-  if (!email || !siteId) return res.json({ ok:false, error:'Missing email or siteId', shop: SHOP });
-
-  const siteIdStr = String(siteId).trim();
-  if (!ID_SET.has(siteIdStr)) return res.json({ ok:false, field:'siteId', error:'Invalid Site ID', shop: SHOP });
-
   try {
-    const emailLower = String(email).toLowerCase();
+    const {
+      email,
+      firstName,
+      lastName,
+      phone,          // optional
+      siteId,
+      titleRole,      // optional
+      password        // required for instant login flow
+    } = req.body || {};
 
-    // Strict exact email lookup
+    if (!email || !siteId) {
+      return res.json({ ok: false, error: 'Missing email or siteId', shop: SHOP });
+    }
+    if (!password || String(password).length < 8) {
+      return res.json({ ok: false, field: 'password', error: 'Password must be at least 8 characters', shop: SHOP });
+    }
+
+    const emailLower = String(email).toLowerCase().trim();
+    const siteIdStr  = String(siteId).trim();
+
+    if (!ID_SET.has(siteIdStr)) {
+      return res.json({ ok: false, field: 'siteId', error: 'Invalid Site ID', shop: SHOP });
+    }
+
+    // 1) Try to find exact customer by email
     const existingId = await findCustomerIdByEmailExact(emailLower);
 
     let customerId: number;
     let action: 'created' | 'updated';
-    let finalPassword: string | undefined;
 
     if (!existingId) {
-      // Create WITH provided password (or generate fallback)
-      const chosenPassword =
-        (typeof password === 'string' && password.length >= 8) ? password : genTempPassword();
-      finalPassword = chosenPassword;
-
-      const sf = await storefrontGraphQL(SF_CUSTOMER_CREATE, {
-        input: {
-          email: emailLower,
-          password: chosenPassword,
-          firstName: firstName || null,
-          lastName:  lastName  || null,
-          phone:     phone     || null,
-          acceptsMarketing: false,
-        },
+      // 2a) CREATE via Admin REST with password for Classic accounts
+      const createResp = await adminREST(SHOP, ADMIN_TOKEN, `/customers.json`, {
+        method: 'POST',
+        body: {
+          customer: {
+            email: emailLower,
+            first_name: firstName || '',
+            last_name:  lastName  || '',
+            phone:       phone     || undefined,
+            verified_email: true,
+            tags: 'approved',
+            password: String(password),
+            password_confirmation: String(password),
+            send_email_welcome: false
+          }
+        }
       });
 
-      const errs: any[] = (sf as any)?.customerCreate?.userErrors || [];
-      if (errs.length) {
-        return res.json({
-          ok: false,
-          error: errs.map(e => e.message).join('; '),
-          field: errs[0]?.field?.[0],
-          shop: SHOP,
-        });
+      const createdId = createResp?.customer?.id ?? null;
+      if (!createdId) {
+        // fallback: recheck by email
+        const recheck = await findCustomerIdByEmailExact(emailLower);
+        if (!recheck) {
+          return res.json({
+            ok: false,
+            error: 'Customer create returned no id',
+            debug: { shop: SHOP, createRespSnippet: JSON.stringify(createResp).slice(0, 400) }
+          });
+        }
+        customerId = recheck;
+      } else {
+        customerId = createdId;
       }
-
-      const gid = (sf as any)?.customerCreate?.customer?.id; // gid://shopify/Customer/<id>
-      if (!gid) return res.json({ ok:false, error:'customerCreate returned no id', shop: SHOP });
-
-      customerId = Number(String(gid).split('/').pop());
       action = 'created';
     } else {
-      // Update names (cannot set password here)
+      // 2b) UPDATE name fields (don’t touch password)
       await adminREST(SHOP, ADMIN_TOKEN, `/customers/${existingId}.json`, {
         method: 'PUT',
-        body: { customer: { id: existingId, first_name: firstName || '', last_name: lastName || '' } },
+        body: {
+          customer: {
+            id: existingId,
+            first_name: firstName || '',
+            last_name:  lastName  || ''
+          }
+        }
       });
       customerId = existingId;
       action = 'updated';
     }
 
-    // Confirm the email for this ID (defensive)
+    // 3) Confirm the email matches
     const confirm = await adminREST(SHOP, ADMIN_TOKEN, `/customers/${customerId}.json`);
     const foundEmail = (confirm?.customer?.email || '').toLowerCase();
     if (foundEmail !== emailLower) {
       return res.json({
-        ok:false,
-        error:`ID/email mismatch. ID ${customerId} belongs to ${confirm?.customer?.email || '(no email)'}`,
-        debug:{ expectedEmail: emailLower, foundEmail, shop: SHOP }
+        ok: false,
+        error: `ID/email mismatch. ID ${customerId} belongs to ${confirm?.customer?.email || '(no email)'}`,
+        debug: { expectedEmail: emailLower, foundEmail, shop: SHOP }
       });
     }
 
-    // Ensure tag 'approved'
+    // 4) Ensure "approved" tag (preserve existing)
     const existingTags = (confirm?.customer?.tags || '')
-      .split(',').map((t:string)=>t.trim()).filter(Boolean);
+      .split(',')
+      .map((t: string) => t.trim())
+      .filter(Boolean);
     const tagSet = new Set(existingTags);
     tagSet.add('approved');
+
     await adminREST(SHOP, ADMIN_TOKEN, `/customers/${customerId}.json`, {
-      method:'PUT',
-      body:{ customer: { id: customerId, tags: Array.from(tagSet).join(', ') } }
+      method: 'PUT',
+      body: { customer: { id: customerId, tags: Array.from(tagSet).join(', ') } }
     });
 
-    // === WRITE METAFIELDS BEFORE RESPONDING ===
+    // 5) Upsert metafields: custom.custom_site_id and custom.titlerole
     await upsertMetafieldREST(customerId, 'custom', 'custom_site_id', 'single_line_text_field', siteIdStr);
-    await upsertMetafieldREST(customerId, 'custom', 'approved',       'boolean',               'true');
-    if (typeof titleRole === 'string' && titleRole.trim()) {
-      await upsertMetafieldREST(customerId, 'custom', 'titlerole',    'single_line_text_field', String(titleRole).trim());
-    }
+    await upsertMetafieldREST(customerId, 'custom', 'titlerole',      'single_line_text_field', String(titleRole || ''));
 
-    // Respond:
-    if (action === 'created' && finalPassword) {
-      // No redirect so client posts to /account/login using this password
-      return res.json({
-        ok: true,
-        action,
-        customerId,
-        email: emailLower,
-        siteId: siteIdStr,
-        password: finalPassword,
-        shop: SHOP
-      });
-    }
-
-    // Existing account (can’t set password) – send to login page (prefilled)
+    // 6) Done — return password back for theme to post to /account/login
     return res.json({
       ok: true,
       action,
       customerId,
       email: emailLower,
       siteId: siteIdStr,
-      redirect: `/account/login?email=${encodeURIComponent(emailLower)}`,
-      shop: SHOP
+      shop: SHOP,
+      password: String(password)
     });
-
-  } catch (e:any) {
-    return res.json({ ok:false, error: String(e?.message || e), shop: SHOP });
+  } catch (e: any) {
+    return res.json({ ok: false, error: String(e?.message || e), shop: SHOP });
   }
 }
 

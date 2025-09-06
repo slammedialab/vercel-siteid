@@ -1,4 +1,6 @@
 // lib/shopify.ts
+
+/** Returns the Admin API version to use, defaulting to a current, supported one. */
 export function apiVersion(): string {
     return process.env.SHOPIFY_API_VERSION || "2025-07";
   }
@@ -10,7 +12,9 @@ export function apiVersion(): string {
     tries?: number;
   };
   
-  function sleep(ms: number) { return new Promise((r) => setTimeout(r, ms)); }
+  function sleep(ms: number) {
+    return new Promise((r) => setTimeout(r, ms));
+  }
   
   export async function adminREST(
     shop: string,
@@ -19,12 +23,13 @@ export function apiVersion(): string {
     init: RESTInit = {}
   ): Promise<any> {
     const version = apiVersion();
+  
     const normalizedPath = path.startsWith("/") ? path : `/${path}`;
     const url = new URL(`https://${shop}/admin/api/${version}${normalizedPath}`);
   
     if (init.qs) {
       for (const [k, v] of Object.entries(init.qs)) {
-        if (v == null) continue;
+        if (v === undefined || v === null) continue;
         url.searchParams.set(k, String(v));
       }
     }
@@ -61,12 +66,17 @@ export function apiVersion(): string {
   
       const text = await r.text();
       let json: any = null;
-      try { json = text ? JSON.parse(text) : null; } catch {}
+      try {
+        json = text ? JSON.parse(text) : null;
+      } catch {
+        // not JSON
+      }
   
       if (!r.ok) {
         const snippet = (text || "").slice(0, 400);
         throw new Error(`REST ${r.status} ${r.statusText} :: ${snippet}`);
       }
+  
       return json;
     }
   }
