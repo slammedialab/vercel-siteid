@@ -7,8 +7,17 @@ import { withCORS } from '../../lib/cors';
 const SHOP = process.env.SHOP as string;            // e.g. yourshop.myshopify.com
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN as string;
 
-// We are NOT using Storefront or GraphQL here to avoid 401s.
 const ID_SET = new Set<string>((ids as any[]).map(v => String(v).trim()));
+
+/** E.164-lite sanitizer; returns null if invalid */
+function normalizePhone(raw: any): string | null {
+  const v = String(raw || '').trim();
+  if (!v) return null;
+  let s = v.replace(/[^\d+]/g, '');            // strip spaces, (), -, etc
+  if (/^\d{10}$/.test(s)) s = '+1' + s;        // default to US if 10 digits
+  if (!/^\+\d{8,15}$/.test(s)) return null;    // quick sanity check
+  return s;
+}
 
 export default async function handler(req: any, res: any) {
   withCORS(res);
@@ -23,39 +32,83 @@ export default async function handler(req: any, res: any) {
       phone,          // optional
       siteId,
       titleRole,      // optional
-      password        // required for instant login flow
+      password,       // required ONLY for brand-new create (Classic)
+      update          // boolean: when true => edit page, update-only
     } = req.body || {};
 
-    if (!email || !siteId) {
-      return res.json({ ok: false, error: 'Missing email or siteId', shop: SHOP });
-    }
-    if (!password || String(password).length < 8) {
-      return res.json({ ok: false, field: 'password', error: 'Password must be at least 8 characters', shop: SHOP });
-    }
+    // ---------- Basic validation ----------
+    const emailLower = String(email || '').toLowerCase().trim();
+    const siteIdStr  = String(siteId || '').trim();
 
-    const emailLower = String(email).toLowerCase().trim();
-    const siteIdStr  = String(siteId).trim();
+    if (!emailLower) return jsonErr(res, 'Missing email', 'email');
+    if (!siteIdStr)  return jsonErr(res, 'Missing siteId', 'siteId');
+    if (!ID_SET.has(siteIdStr)) return jsonErr(res, 'Invalid Site ID', 'siteId');
 
-    if (!ID_SET.has(siteIdStr)) {
-      return res.json({ ok: false, field: 'siteId', error: 'Invalid Site ID', shop: SHOP });
-    }
-
-    // 1) Try to find exact customer by email
+    // Strict find by exact email
     const existingId = await findCustomerIdByEmailExact(emailLower);
 
+    // ---------- UPDATE-ONLY (Edit page) ----------
+    if (update === true) {
+      if (!existingId) return jsonErr(res, 'No existing account for that email', 'email');
+      const cid = existingId;
+
+      // Names
+      await adminREST(SHOP, ADMIN_TOKEN, `/customers/${cid}.json`, {
+        method: 'PUT',
+        body: { customer: { id: cid, first_name: String(firstName || ''), last_name: String(lastName || '') } }
+      });
+
+      // Phone (best effort)
+      const phoneClean = normalizePhone(phone);
+      if (phoneClean) {
+        try {
+          await adminREST(SHOP, ADMIN_TOKEN, `/customers/${cid}.json`, {
+            method: 'PUT',
+            body: { customer: { id: cid, phone: phoneClean } }
+          });
+        } catch { /* ignore 422/validation */ }
+      }
+
+      // Ensure "approved" tag
+      try {
+        const confirm = await adminREST(SHOP, ADMIN_TOKEN, `/customers/${cid}.json`);
+        const tags = ((confirm?.customer?.tags || '') as string).split(',').map(t => t.trim()).filter(Boolean);
+        if (!tags.includes('approved')) {
+          tags.push('approved');
+          await adminREST(SHOP, ADMIN_TOKEN, `/customers/${cid}.json`, {
+            method: 'PUT',
+            body: { customer: { id: cid, tags: tags.join(', ') } }
+          });
+        }
+      } catch {}
+
+      // Metafields
+      await upsertMetafieldREST(cid, 'custom', 'custom_site_id', 'single_line_text_field', siteIdStr);
+      await upsertMetafieldREST(cid, 'custom', 'titlerole',      'single_line_text_field', String(titleRole || ''));
+
+      return res.json({ ok: true, action: 'updated', customerId: cid, email: emailLower, siteId: siteIdStr, shop: SHOP });
+    }
+
+    // ---------- REGISTER (create-or-update) ----------
     let customerId: number;
     let action: 'created' | 'updated';
 
     if (!existingId) {
-      // 2a) CREATE via Admin REST with password for Classic accounts
+      // New create requires password (Classic accounts)
+      if (!password || String(password).length < 8) {
+        return jsonErr(res, 'Password must be at least 8 characters', 'password');
+      }
+
+      const phoneClean = normalizePhone(phone) || undefined;
+
       const createResp = await adminREST(SHOP, ADMIN_TOKEN, `/customers.json`, {
         method: 'POST',
         body: {
           customer: {
             email: emailLower,
-            first_name: firstName || '',
-            last_name:  lastName  || '',
-            phone:       phone     || undefined,
+            first_name: String(firstName || ''),
+            last_name:  String(lastName  || ''),
+            phone: phoneClean,
             verified_email: true,
             tags: 'approved',
             password: String(password),
@@ -67,14 +120,9 @@ export default async function handler(req: any, res: any) {
 
       const createdId = createResp?.customer?.id ?? null;
       if (!createdId) {
-        // fallback: recheck by email
         const recheck = await findCustomerIdByEmailExact(emailLower);
         if (!recheck) {
-          return res.json({
-            ok: false,
-            error: 'Customer create returned no id',
-            debug: { shop: SHOP, createRespSnippet: JSON.stringify(createResp).slice(0, 400) }
-          });
+          return jsonErr(res, 'Customer create returned no id');
         }
         customerId = recheck;
       } else {
@@ -82,65 +130,65 @@ export default async function handler(req: any, res: any) {
       }
       action = 'created';
     } else {
-      // 2b) UPDATE name fields (don’t touch password)
-      await adminREST(SHOP, ADMIN_TOKEN, `/customers/${existingId}.json`, {
-        method: 'PUT',
-        body: {
-          customer: {
-            id: existingId,
-            first_name: firstName || '',
-            last_name:  lastName  || ''
-          }
-        }
-      });
+      // Email already exists — do a light update (no password!)
       customerId = existingId;
       action = 'updated';
+
+      await adminREST(SHOP, ADMIN_TOKEN, `/customers/${customerId}.json`, {
+        method: 'PUT',
+        body: { customer: { id: customerId, first_name: String(firstName || ''), last_name: String(lastName || '') } }
+      });
+
+      const phoneClean = normalizePhone(phone);
+      if (phoneClean) {
+        try {
+          await adminREST(SHOP, ADMIN_TOKEN, `/customers/${customerId}.json`, {
+            method: 'PUT',
+            body: { customer: { id: customerId, phone: phoneClean } }
+          });
+        } catch { /* ignore */ }
+      }
     }
 
-    // 3) Confirm the email matches
+    // Confirm email matches id
     const confirm = await adminREST(SHOP, ADMIN_TOKEN, `/customers/${customerId}.json`);
     const foundEmail = (confirm?.customer?.email || '').toLowerCase();
     if (foundEmail !== emailLower) {
-      return res.json({
-        ok: false,
-        error: `ID/email mismatch. ID ${customerId} belongs to ${confirm?.customer?.email || '(no email)'}`,
-        debug: { expectedEmail: emailLower, foundEmail, shop: SHOP }
+      return jsonErr(res, `ID/email mismatch. ID ${customerId} belongs to ${confirm?.customer?.email || '(no email)'}`);
+    }
+
+    // Ensure approved tag
+    const existingTags = (confirm?.customer?.tags || '')
+      .split(',').map((t: string) => t.trim()).filter(Boolean);
+    if (!existingTags.includes('approved')) {
+      existingTags.push('approved');
+      await adminREST(SHOP, ADMIN_TOKEN, `/customers/${customerId}.json`, {
+        method: 'PUT',
+        body: { customer: { id: customerId, tags: existingTags.join(', ') } }
       });
     }
 
-    // 4) Ensure "approved" tag (preserve existing)
-    const existingTags = (confirm?.customer?.tags || '')
-      .split(',')
-      .map((t: string) => t.trim())
-      .filter(Boolean);
-    const tagSet = new Set(existingTags);
-    tagSet.add('approved');
-
-    await adminREST(SHOP, ADMIN_TOKEN, `/customers/${customerId}.json`, {
-      method: 'PUT',
-      body: { customer: { id: customerId, tags: Array.from(tagSet).join(', ') } }
-    });
-
-    // 5) Upsert metafields: custom.custom_site_id and custom.titlerole
+    // Metafields
     await upsertMetafieldREST(customerId, 'custom', 'custom_site_id', 'single_line_text_field', siteIdStr);
     await upsertMetafieldREST(customerId, 'custom', 'titlerole',      'single_line_text_field', String(titleRole || ''));
 
-    // 6) Done — return password back for theme to post to /account/login
-    return res.json({
-      ok: true,
-      action,
-      customerId,
-      email: emailLower,
-      siteId: siteIdStr,
-      shop: SHOP,
-      password: String(password)
-    });
+    // Return password ONLY when we created a brand-new account (for auto-login POST to /account/login)
+    const payload: any = { ok: true, action, customerId, email: emailLower, siteId: siteIdStr, shop: SHOP };
+    if (action === 'created' && password) payload.password = String(password);
+
+    return res.json(payload);
+
   } catch (e: any) {
-    return res.json({ ok: false, error: String(e?.message || e), shop: SHOP });
+    return jsonErr(res, String(e?.message || e));
   }
 }
 
 /* ---------------- Helpers ---------------- */
+
+function jsonErr(res: any, error: string, field?: string) {
+  return res.json({ ok: false, error, field, shop: SHOP });
+}
+
 async function findCustomerIdByEmailExact(emailLower: string): Promise<number | null> {
   try {
     const resp = await adminREST(SHOP, ADMIN_TOKEN, `/customers/search.json`, { qs: { query: `email:"${emailLower}"` } });
