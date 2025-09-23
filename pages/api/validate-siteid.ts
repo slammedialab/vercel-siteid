@@ -1,8 +1,8 @@
 // pages/api/validate-siteid.ts
-import ids from '../../data/site-ids.json';
+import directory from '../../data/site-directory.json';
 import { withCORS } from '../../lib/cors';
 
-const ID_SET = new Set<string>((ids as any[]).map(v => String(v).trim()));
+type Dir = Record<string, { accountName?: string; accountId?: string }>;
 
 export default async function handler(req: any, res: any) {
   withCORS(res);
@@ -11,7 +11,12 @@ export default async function handler(req: any, res: any) {
   if (req.method !== 'GET')     return res.status(405).end();
 
   const siteId = String(req.query.siteId ?? '').trim();
-  const valid  = !!siteId && ID_SET.has(siteId);
+  const entry  = (directory as Dir)[siteId];
 
-  return res.status(200).json({ valid });
+  const valid = !!entry;
+  return res.status(200).json({
+    valid,
+    accountName: valid ? (entry.accountName ?? null) : null,
+    accountId:   valid ? (entry.accountId   ?? null) : null
+  });
 }
