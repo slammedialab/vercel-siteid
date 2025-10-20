@@ -1,12 +1,10 @@
 // pages/api/validate-register.ts
-import directory from '../../data/site-directory.json';
 import { adminREST } from '../../lib/shopify';
 import { withCORS } from '../../lib/cors';
+import { getDirectoryMap } from '../../lib/site-directory';
 
 const SHOP = process.env.SHOP as string;
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN as string;
-
-type Dir = Record<string, { accountName?: string; accountId?: string }>;
 
 function normalizePhone(raw: any): string | null {
   const v = String(raw || '').trim();
@@ -24,13 +22,14 @@ export default async function handler(req: any, res: any) {
 
   try {
     const { email, firstName, lastName, phone, siteId, titleRole, password, update } = req.body || {};
-
     const emailLower = String(email || '').toLowerCase().trim();
     const siteIdStr  = String(siteId || '').trim();
     if (!emailLower) return jsonErr(res, 'Missing email', 'email');
     if (!siteIdStr)  return jsonErr(res, 'Missing siteId', 'siteId');
 
-    const match = (directory as Dir)[siteIdStr];
+    // ← NEW: live directory from Sheet
+    const directory = await getDirectoryMap();
+    const match = directory[siteIdStr];
     if (!match) return jsonErr(res, 'Invalid Site ID', 'siteId');
 
     const accountName = match.accountName || '';
@@ -57,7 +56,6 @@ export default async function handler(req: any, res: any) {
         } catch {}
       }
 
-      // Ensure approved tag
       try {
         const confirm = await adminREST(SHOP, ADMIN_TOKEN, `/customers/${cid}.json`);
         const tags = ((confirm?.customer?.tags || '') as string).split(',').map(t => t.trim()).filter(Boolean);
@@ -70,7 +68,6 @@ export default async function handler(req: any, res: any) {
         }
       } catch {}
 
-      // Metafields
       await upsertMetafieldREST(cid, 'custom', 'custom_site_id', 'single_line_text_field', siteIdStr);
       await upsertMetafieldREST(cid, 'custom', 'account_name',   'single_line_text_field', accountName);
       await upsertMetafieldREST(cid, 'custom', 'account_id',     'single_line_text_field', accountId);
@@ -82,7 +79,7 @@ export default async function handler(req: any, res: any) {
       });
     }
 
-    // Create-or-update
+    // create-or-update (unchanged)
     let customerId: number;
     let action: 'created' | 'updated';
     if (!existingId) {
@@ -127,12 +124,10 @@ export default async function handler(req: any, res: any) {
       }
     }
 
-    // Confirm email matches id
     const confirm = await adminREST(SHOP, ADMIN_TOKEN, `/customers/${customerId}.json`);
     const foundEmail = (confirm?.customer?.email || '').toLowerCase();
     if (foundEmail !== emailLower) return jsonErr(res, `ID/email mismatch. ID ${customerId} belongs to ${confirm?.customer?.email || '(no email)'}`);
 
-    // Ensure approved tag
     const existingTags = (confirm?.customer?.tags || '').split(',').map((t: string) => t.trim()).filter(Boolean);
     if (!existingTags.includes('approved')) {
       existingTags.push('approved');
@@ -142,7 +137,6 @@ export default async function handler(req: any, res: any) {
       });
     }
 
-    // Metafields (always write from directory)
     await upsertMetafieldREST(customerId, 'custom', 'custom_site_id', 'single_line_text_field', siteIdStr);
     await upsertMetafieldREST(customerId, 'custom', 'account_name',   'single_line_text_field', accountName);
     await upsertMetafieldREST(customerId, 'custom', 'account_id',     'single_line_text_field', accountId);

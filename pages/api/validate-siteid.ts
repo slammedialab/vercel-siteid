@@ -1,8 +1,6 @@
 // pages/api/validate-siteid.ts
-import directory from '../../data/site-directory.json';
 import { withCORS } from '../../lib/cors';
-
-type Dir = Record<string, { accountName?: string; accountId?: string }>;
+import { getDirectoryMap } from '../../lib/site-directory';
 
 export default async function handler(req: any, res: any) {
   withCORS(res);
@@ -11,7 +9,8 @@ export default async function handler(req: any, res: any) {
   if (req.method !== 'GET')     return res.status(405).end();
 
   const siteId = String(req.query.siteId ?? '').trim();
-  const entry  = (directory as Dir)[siteId];
+  const directory = await getDirectoryMap();
+  const entry = directory[siteId];
 
   const valid = !!entry;
   return res.status(200).json({
