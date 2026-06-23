@@ -9,7 +9,7 @@
     "start": "next start -p 3000"
   },
   "dependencies": {
-    "next": "^15.5.2",
+    "next": "15.5.9",
     "react": "^19.1.1",
     "react-dom": "^19.1.1"
   },
